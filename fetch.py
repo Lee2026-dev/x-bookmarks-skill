@@ -180,44 +180,189 @@ def parse_page(data):
     return tweets, next_cursor
 
 
-_ENGAGEMENT_RE = re.compile(r'^\d+(?:[.,]\d+)?[KMBkmb]?$')
+def html_to_article_markdown(html: str) -> str:
+    from markdownify import markdownify as _md
+    return _md(html, heading_style="ATX", code_language="", newline_style="backslash").strip()
 
 
-def _strip_article_header(text, article_title):
-    """Remove X article page chrome (duplicate title, author, nav stats) from main inner_text."""
-    lines = text.split('\n')
+def clean_article_markdown(text: str, article_title: str = None) -> str:
+    lines = text.split("\n")
+
+    # Remove duplicate title at top (markdownify often repeats it)
+    if article_title:
+        cleaned_start = []
+        title_removed = False
+        for line in lines:
+            stripped = line.strip()
+            if not title_removed and stripped and stripped == article_title:
+                title_removed = True
+                continue
+            cleaned_start.append(line)
+        lines = cleaned_start
+
+    # Remove orphan profile image links: [![](twimg profile pic)](/user)
+    lines = [l for l in lines if not re.match(
+        r'^\s*\[?\!?\[.*?\]\(https?://pbs\.twimg\.com/profile_images/.*?\)\]?\(?/.*?\)?\s*$', l
+    )]
+
+    # Strip chrome/engagement lines
+    chrome_patterns = [
+        r'^\s*·\s*$',
+        r'^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s*$',
+        r'^\s*·\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s*$',
+        r'^\s*Subscribe\s*$',
+        r'^\s*Click to (Subscribe|Unfollow).*$',
+        r'^\s*Following\s*$',
+        r'^\s*Want to publish your own Article\?\s*$',
+        r'^\s*\[Upgrade to Premium\].*$',
+        r'^\s*\d+(\.\d+)?[KMB]?\s*$',
+        r'^\s*\[\d+(\.\d+)?[KMB]?\]\(.*?/analytics\)\s*$',
+        r'^\s*\[@\w+\]\(/\w+\)\s*$',
+        r'^\s*!\[\]\(https?://pbs\.twimg\.com/profile_images/.*?\)\s*$',
+    ]
+    chrome_re = re.compile("|".join(f"({p})" for p in chrome_patterns))
+    lines = [l for l in lines if not chrome_re.match(l)]
+
+    # Remove multi-line author name blocks: "[Name\n...\n](/user)"
+    # Also remove orphan "[Name" lines left after profile image removal
+    cleaned = []
     i = 0
-    # Skip duplicate title line
-    if lines and lines[i].strip() == article_title:
-        i += 1
-    # Skip short nav lines (author name, @handle, ·, date, Subscribe, numeric stats)
     while i < len(lines):
-        line = lines[i].strip()
-        if line and len(line) > 30:
-            break
+        if re.match(r'^\s*\[[\w\s]+$', lines[i]) and not lines[i].strip().startswith('[http'):
+            found_close = False
+            for j in range(i + 1, min(i + 6, len(lines))):
+                if re.match(r'^\s*\]\(/\w+\)\s*$', lines[j]):
+                    found_close = True
+                    i = j + 1
+                    break
+            if found_close:
+                continue
+            # Orphan open bracket with just a name — skip it too
+            if re.match(r'^\s*\[\w[\w\s]*$', lines[i].rstrip()):
+                i += 1
+                continue
+        cleaned.append(lines[i])
         i += 1
-    return '\n'.join(lines[i:]).strip()
+    lines = cleaned
 
-
-_ARTICLE_PAGE_FOOTER = "Want to publish your own Article?"
-
-
-def _strip_article_footer(text):
-    """Strip X article page footer and trailing engagement-number lines."""
-    # Cut at the standard X article page footer marker
-    idx = text.find(_ARTICLE_PAGE_FOOTER)
-    if idx != -1:
-        text = text[:idx].rstrip()
-    # Walk backwards: also drop blank lines and standalone engagement-stat lines at tail
-    lines = text.split('\n')
-    cut = len(lines)
-    for i in range(len(lines) - 1, -1, -1):
-        line = lines[i].strip()
-        if not line or _ENGAGEMENT_RE.match(line):
-            cut = i
-        else:
+    # Remove trailing author bio card
+    cut_idx = None
+    for i in range(len(lines) - 1, max(len(lines) - 40, -1), -1):
+        if re.match(r'^\s*-\s*\[?\!?\[.*?\]\(https?://pbs\.twimg\.com/profile_images/', lines[i]):
+            cut_idx = i
             break
-    return '\n'.join(lines[:cut]).rstrip()
+        # Also match: "- [@username](/username)" pattern
+        if re.match(r'^\s*-\s*\[@\w+\]\(/\w+\)', lines[i]):
+            cut_idx = i
+            break
+    if cut_idx is not None:
+        lines = lines[:cut_idx]
+
+    # Collapse 3+ consecutive blank lines to 2
+    result = []
+    blank_count = 0
+    for line in lines:
+        if line.strip() == "":
+            blank_count += 1
+            if blank_count <= 2:
+                result.append(line)
+        else:
+            blank_count = 0
+            result.append(line)
+
+    # Rejoin broken inline links: markdownify splits "[text](url)" onto separate lines
+    # when the original HTML had block-level <a> tags.
+    joined = []
+    i = 0
+    while i < len(result):
+        line = result[i]
+        if line.strip() and i + 1 < len(result):
+            buf = line.rstrip()
+            j = i + 1
+            has_link = bool(re.search(r'\[.+?\]\(.+?\)', buf))
+            while j < len(result):
+                if result[j].strip() == "" and j + 1 < len(result) and result[j + 1].strip():
+                    peek = result[j + 1].strip()
+                    if re.match(r'^\[.+?\]\(.+?\)', peek) or re.match(r'^[,;.]', peek):
+                        j += 1
+                        continue
+                    elif has_link and re.match(r'^[a-z]', peek):
+                        j += 1
+                        continue
+                    else:
+                        break
+                elif result[j].strip() == "":
+                    break
+                else:
+                    stripped = result[j].strip()
+                    if re.match(r'^\[.+?\]\(.+?\)\s*[,;.]?\s*$', stripped) or re.match(r'^[,;.]\s*', stripped):
+                        if re.match(r'^[,;.]', stripped):
+                            buf = buf + stripped
+                        else:
+                            buf = buf + " " + stripped
+                        has_link = True
+                        j += 1
+                        continue
+                    # Lowercase continuation directly after a link line
+                    elif has_link and re.match(r'^[a-z]', stripped):
+                        buf = buf + " " + stripped
+                        j += 1
+                        while j < len(result) and result[j].strip() and not re.match(r'^#{1,6}\s', result[j].strip()):
+                            nxt = result[j].strip()
+                            if re.match(r'^\[.+?\]\(.+?\)', nxt):
+                                buf = buf + " " + nxt
+                                has_link = True
+                                j += 1
+                                continue
+                            elif re.match(r'^[,;.]', nxt):
+                                buf = buf + nxt
+                                j += 1
+                                continue
+                            else:
+                                buf = buf + " " + nxt
+                                j += 1
+                        break
+                    else:
+                        if has_link and buf != line.rstrip():
+                            buf = buf + " " + stripped
+                            j += 1
+                            while j < len(result) and result[j].strip() and not re.match(r'^#{1,6}\s', result[j].strip()):
+                                buf = buf + " " + result[j].strip()
+                                j += 1
+                        break
+                j += 1
+            if j > i + 1:
+                joined.append(buf)
+                i = j
+                continue
+        joined.append(line)
+        i += 1
+
+    # Second pass: merge paragraphs split by blank lines when next starts with [link](url)
+    # followed by continuation text (same paragraph broken by markdownify)
+    # Run iteratively until no more merges happen
+    changed = True
+    while changed:
+        changed = False
+        merged = []
+        i = 0
+        while i < len(joined):
+            line = joined[i]
+            if (line.strip()
+                and not re.match(r'^#{1,6}\s', line.strip())
+                and not re.match(r'^\s*[-*\d]', line.strip())
+                and i + 2 < len(joined)
+                and joined[i + 1].strip() == ""
+                and re.match(r'^\[.+?\]\(.+?\)\s', joined[i + 2].strip())):
+                merged.append(line.rstrip() + " " + joined[i + 2].strip())
+                i += 3
+                changed = True
+                continue
+            merged.append(line)
+            i += 1
+        joined = merged
+
+    return "\n".join(merged).strip()
 
 
 def fetch_article_body(tweet_url, article_title, article_rest_id=None):
@@ -227,7 +372,12 @@ def fetch_article_body(tweet_url, article_title, article_rest_id=None):
         print("  ! playwright not installed. Run: pip install playwright && playwright install chromium")
         return None
 
-    # /i/article/{rest_id} when available; else derive from tweet URL (/status/ → /article/)
+    try:
+        from markdownify import markdownify  # noqa: F401 — verify dep before launching browser
+    except ImportError:
+        print("  ! markdownify not installed. Run: pip install markdownify")
+        return None
+
     article_url = f"https://x.com/i/article/{article_rest_id}" if article_rest_id else tweet_url.replace("/status/", "/article/")
     print(f"  [playwright] fetching {article_url}")
 
@@ -245,12 +395,36 @@ def fetch_article_body(tweet_url, article_title, article_rest_id=None):
             ])
             page = ctx.new_page()
             page.goto(article_url, wait_until="domcontentloaded", timeout=30000)
-            # Initial wait for JS hydration; X.com never reaches networkidle (websockets)
             page.wait_for_timeout(5000)
-            # Scroll to trigger lazy-loaded article content below the fold
             for _ in range(6):
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1000)
+
+            # Remove chrome: header/nav/footer/byline/stats before extracting content
+            page.evaluate("""() => {
+                const noise = [
+                    'header', 'nav', 'footer',
+                    '[data-testid="article-header"]',
+                    '[data-testid="article-footer"]',
+                    '[data-testid="articleHeader"]',
+                    '[data-testid="articleFooter"]',
+                    '[data-testid="sheetDialog"]',
+                    '[data-testid="User-Name"]',
+                    '[data-testid="caret"]',
+                    '[data-testid="app-text-transition-container"]',
+                    '[role="group"]',
+                    '[aria-label="Subscribe"]',
+                    '[aria-label*="Subscribe to"]',
+                    '[aria-label*="Unfollow"]',
+                    'a[href*="/i/premium_sign_up"]',
+                ];
+                noise.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
+                // Remove small profile avatar images in byline area
+                document.querySelectorAll('img[src*="/profile_images/"]').forEach(el => {
+                    const w = el.width || el.naturalWidth || 0;
+                    if (w <= 48) el.closest('a')?.remove() || el.remove();
+                });
+            }""")
 
             for selector in [
                 "[data-testid='article-content']",
@@ -260,9 +434,10 @@ def fetch_article_body(tweet_url, article_title, article_rest_id=None):
             ]:
                 el = page.query_selector(selector)
                 if el:
-                    raw = el.inner_text().strip()
-                    text = _strip_article_header(raw, article_title)
-                    text = _strip_article_footer(text)
+                    html = el.inner_html()
+                    text = clean_article_markdown(
+                        html_to_article_markdown(html), article_title
+                    )
                     if len(text) > 500:
                         browser.close()
                         return text
@@ -271,6 +446,121 @@ def fetch_article_body(tweet_url, article_title, article_rest_id=None):
     except Exception as e:
         print(f"  ! Playwright fetch failed: {e}")
         return None
+
+
+TWEET_DETAIL_QUERY_ID = "xOhkmRac04YFZmOzU9PJHg"
+TWEET_DETAIL_URL = f"https://x.com/i/api/graphql/{TWEET_DETAIL_QUERY_ID}/TweetDetail"
+
+
+def fetch_single_tweet_data(tweet_id):
+    variables = {
+        "focalTweetId": tweet_id,
+        "with_rux_injections": False,
+        "rankingMode": "Relevance",
+        "includePromotedContent": True,
+        "withCommunity": True,
+        "withQuickPromoteEligibilityTweetFields": True,
+        "withBirdwatchNotes": True,
+        "withVoice": True,
+    }
+    tweet_features = {
+        **FEATURES,
+        "rweb_tipjar_consumption_enabled": True,
+        "creator_subscriptions_quote_tweet_preview_enabled": True,
+        "c9s_tweet_anatomy_moderator_badge_enabled": True,
+        "articles_preview_enabled": True,
+        "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    }
+    params = {
+        "variables": json.dumps(variables),
+        "features": json.dumps(tweet_features),
+    }
+    r = requests.get(TWEET_DETAIL_URL, headers=headers(), params=params, timeout=30)
+    if r.status_code != 200:
+        print(f"Error {r.status_code}: {r.text[:300]}")
+        sys.exit(1)
+
+    data = r.json()
+    tweet_obj = None
+    # TweetDetail may return either key depending on query version
+    conv = (
+        data.get("data", {}).get("threaded_conversation_with_injections_v2")
+        or data.get("data", {}).get("threaded_conversation_with_injections")
+    )
+    try:
+        entries = conv["instructions"][0]["entries"]
+        for entry in entries:
+            if entry.get("entryId", "").startswith(f"tweet-{tweet_id}"):
+                item = entry["content"]["itemContent"]["tweet_results"]["result"]
+                tweet_obj = item.get("tweet", item)
+                break
+    except (KeyError, TypeError, IndexError):
+        pass
+
+    if tweet_obj is None:
+        # Fallback: tweetResult path
+        try:
+            result = data["data"]["tweetResult"]["result"]
+            tweet_obj = result.get("tweet", result)
+        except (KeyError, TypeError):
+            print("Tweet not found in response.")
+            sys.exit(1)
+
+    legacy = tweet_obj["legacy"]
+    user_result = tweet_obj["core"]["user_results"]["result"]
+    user_core = user_result.get("core") or user_result.get("legacy", {})
+
+    username = user_core["screen_name"]
+    full_text = legacy["full_text"]
+    created_at = legacy["created_at"]
+    dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S +0000 %Y")
+    date_str = dt.strftime("%Y-%m-%d")
+
+    media_urls = []
+    extended = legacy.get("extended_entities", {})
+    for m in extended.get("media", []):
+        if m["type"] == "photo":
+            media_urls.append(m["media_url_https"])
+        elif m["type"] in ("video", "animated_gif"):
+            variants = m.get("video_info", {}).get("variants", [])
+            mp4s = [v for v in variants if v.get("content_type") == "video/mp4"]
+            if mp4s:
+                best = max(mp4s, key=lambda v: v.get("bitrate", 0))
+                media_urls.append(best["url"])
+
+    hashtags = [h["text"].lower() for h in legacy.get("entities", {}).get("hashtags", [])]
+
+    # Article data lives at different paths depending on API endpoint
+    article_raw = tweet_obj.get("article", {})
+    article_data = (
+        article_raw.get("article_results", {}).get("result")
+        or article_raw.get("article")
+        or {}
+    )
+    article_title = article_data.get("title")
+    article_preview = article_data.get("preview_text")
+    article_cover = (
+        article_data.get("cover_media", {})
+        .get("media_info", {})
+        .get("original_img_url")
+    )
+    article_rest_id = article_data.get("rest_id")
+
+    return {
+        "id": tweet_id,
+        "username": username,
+        "date": date_str,
+        "text": full_text,
+        "url": f"https://x.com/{username}/status/{tweet_id}",
+        "media": media_urls,
+        "hashtags": hashtags,
+        "article_title": article_title,
+        "article_preview": article_preview,
+        "article_cover": article_cover,
+        "article_rest_id": article_rest_id,
+    }
+
+
 
 
 def safe_username(username):
@@ -293,7 +583,7 @@ def write_tweet(tweet):
         cover_line = f"\n\n![]({tweet['article_cover']})" if tweet.get("article_cover") else ""
         full_body = fetch_article_body(tweet["url"], tweet["article_title"], tweet.get("article_rest_id"))
         if full_body:
-            body = f"# {tweet['article_title']}\n\n{full_body}{cover_line}"
+            body = f"# {tweet['article_title']}\n\n{full_body}"
         else:
             preview = tweet.get("article_preview") or ""
             body = f"# {tweet['article_title']}\n\n{preview}…{cover_line}\n\n> [Read full article]({tweet['url']})"
@@ -317,6 +607,13 @@ tags: {tags_yaml}
     return True
 
 
+def parse_tweet_url(url):
+    m = re.match(r'https?://(?:x|twitter)\.com/\w+/status/(\d+)', url)
+    if m:
+        return m.group(1)
+    return None
+
+
 def main():
     if not CT0 or not AUTH_TOKEN:
         print("Missing env vars. Export before running:")
@@ -325,6 +622,27 @@ def main():
         sys.exit(1)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Single URL mode
+    if len(sys.argv) > 1:
+        url = sys.argv[1]
+        tweet_id = parse_tweet_url(url)
+        if not tweet_id:
+            print(f"Invalid tweet URL: {url}")
+            sys.exit(1)
+
+        print(f"Fetching single tweet {tweet_id}...")
+        tweet = fetch_single_tweet_data(tweet_id)
+        written = write_tweet(tweet)
+        if written:
+            filename = f"{tweet['id']}_{safe_username(tweet['username'])}.md"
+            print(f"  + {OUTPUT_DIR / filename}")
+        else:
+            filename = f"{tweet['id']}_{safe_username(tweet['username'])}.md"
+            print(f"  = {filename} already exists")
+        return
+
+    # Bulk bookmarks mode
     print(f"Output: {OUTPUT_DIR}")
 
     cursor = None

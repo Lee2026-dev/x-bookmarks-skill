@@ -38,8 +38,8 @@ First time — create venv and install deps:
 python3 -m venv /tmp/xbm-venv
 /tmp/xbm-venv/bin/pip install requests -q
 
-# For full X Article body (optional, ~130 MB one-time download):
-/tmp/xbm-venv/bin/pip install playwright -q
+# For full X Article body with rich formatting (optional, ~130 MB one-time download):
+/tmp/xbm-venv/bin/pip install playwright markdownify -q
 /tmp/xbm-venv/bin/playwright install chromium
 ```
 
