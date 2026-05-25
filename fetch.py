@@ -6,6 +6,7 @@ import time
 import re
 from pathlib import Path
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 try:
     import requests
@@ -19,6 +20,8 @@ OUTPUT_DIR = Path(os.environ.get("X_BOOKMARKS_OUTPUT_DIR", "~/.x-bookmarks/")).e
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 XAI_API_URL = "https://api.x.ai/v1/responses"
 XAI_MODEL = "grok-3-mini"
+XQUIK_BASE_URL = os.environ.get("XQUIK_BASE_URL", "https://xquik.com").rstrip("/")
+XQUIK_FOLDER_ID = os.environ.get("X_BOOKMARKS_FOLDER_ID")
 
 BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 
@@ -49,6 +52,223 @@ FEATURES = {
     "longform_notetweets_inline_media_enabled": True,
     "responsive_web_enhance_cards_enabled": False,
 }
+
+
+def xquik_api_key():
+    return os.environ.get("XQUIK_API_KEY") or os.environ.get("HERMES_TWEET_API_KEY")
+
+
+def xquik_headers(api_key):
+    headers = {"Accept": "application/json"}
+    if api_key.startswith("xq_"):
+        headers["x-api-key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def xquik_get(path, params=None):
+    api_key = xquik_api_key()
+    if not api_key:
+        return None
+
+    url = f"{XQUIK_BASE_URL}{path}"
+    r = requests.get(url, headers=xquik_headers(api_key), params=params or {}, timeout=30)
+
+    if r.status_code == 429:
+        print("Rate limited (429). Wait, then re-run.")
+        sys.exit(1)
+    if r.status_code in (401, 403):
+        print(f"Xquik auth error ({r.status_code}). Check XQUIK_API_KEY.")
+        sys.exit(1)
+    if r.status_code != 200:
+        print(f"Xquik error {r.status_code}: {r.text[:300]}")
+        sys.exit(1)
+
+    return r.json()
+
+
+def fetch_xquik_bookmarks_page(cursor=None):
+    params = {}
+    if cursor:
+        params["cursor"] = cursor
+    if XQUIK_FOLDER_ID:
+        params["folderId"] = XQUIK_FOLDER_ID
+    return xquik_get("/api/v1/x/bookmarks", params=params)
+
+
+def fetch_xquik_tweet(tweet_id):
+    payload = xquik_get(f"/api/v1/x/tweets/{tweet_id}")
+    tweet = normalize_xquik_tweet(payload)
+    if not tweet:
+        print("Tweet not found in Xquik response.")
+        sys.exit(1)
+    return tweet
+
+
+def first_value(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def extract_xquik_items(data):
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("bookmarks", "tweets", "items", "results", "timeline", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = extract_xquik_items(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_xquik_cursor(data):
+    if not isinstance(data, dict):
+        return None
+
+    for key in ("nextCursor", "next_cursor", "next", "bottomCursor", "cursor"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    for key in ("meta", "pagination"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            cursor = extract_xquik_cursor(value)
+            if cursor:
+                return cursor
+    return None
+
+
+def parse_xquik_date(value):
+    if isinstance(value, (int, float)):
+        if value > 10_000_000_000:
+            value = value / 1000
+        return datetime.utcfromtimestamp(value).strftime("%Y-%m-%d")
+    if not isinstance(value, str) or not value:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    try:
+        return parsedate_to_datetime(value).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def normalize_xquik_author(item):
+    author = item.get("author") or item.get("user") or {}
+    if isinstance(author, dict):
+        username = first_value(
+            author.get("username"),
+            author.get("screen_name"),
+            author.get("handle"),
+            item.get("username"),
+            "unknown",
+        )
+        name = first_value(author.get("name"), author.get("display_name"), username)
+    else:
+        username = first_value(author, item.get("username"), "unknown")
+        name = username
+
+    return str(username).lstrip("@"), str(name)
+
+
+def normalize_xquik_media(item):
+    media = item.get("media") or item.get("media_urls") or []
+    urls = []
+    for entry in media:
+        if isinstance(entry, str):
+            urls.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        url = first_value(
+            entry.get("media_url_https"),
+            entry.get("mediaUrl"),
+            entry.get("url"),
+            entry.get("preview_image_url"),
+        )
+        variants = entry.get("video_info", {}).get("variants", [])
+        mp4s = [v for v in variants if v.get("content_type") == "video/mp4"]
+        if mp4s:
+            url = max(mp4s, key=lambda v: v.get("bitrate", 0)).get("url") or url
+        if url:
+            urls.append(url)
+    return urls
+
+
+def normalize_xquik_hashtags(item):
+    hashtags = item.get("hashtags")
+    if isinstance(hashtags, list):
+        return [str(tag).lstrip("#").lower() for tag in hashtags if tag]
+
+    entities = item.get("entities") or {}
+    if isinstance(entities, dict):
+        return [
+            str(tag.get("text", "")).lstrip("#").lower()
+            for tag in entities.get("hashtags", [])
+            if isinstance(tag, dict) and tag.get("text")
+        ]
+    return []
+
+
+def normalize_xquik_tweet(item):
+    if isinstance(item, dict):
+        for wrapper in ("tweet", "data", "result", "item"):
+            if isinstance(item.get(wrapper), dict):
+                item = item[wrapper]
+                break
+    if not isinstance(item, dict):
+        return None
+
+    tweet_id = first_value(
+        item.get("id"),
+        item.get("id_str"),
+        item.get("tweet_id"),
+        item.get("tweetId"),
+        item.get("rest_id"),
+    )
+    if not tweet_id:
+        return None
+
+    username, _name = normalize_xquik_author(item)
+    article = item.get("article") if isinstance(item.get("article"), dict) else {}
+
+    return {
+        "id": str(tweet_id),
+        "username": username,
+        "date": parse_xquik_date(first_value(item.get("created_at"), item.get("createdAt"))),
+        "text": str(first_value(item.get("text"), item.get("full_text"), item.get("body"), "")),
+        "url": str(first_value(item.get("url"), f"https://x.com/{username}/status/{tweet_id}")),
+        "media": normalize_xquik_media(item),
+        "hashtags": normalize_xquik_hashtags(item),
+        "article_title": first_value(item.get("article_title"), article.get("title")),
+        "article_preview": first_value(item.get("article_preview"), article.get("preview_text")),
+        "article_cover": first_value(item.get("article_cover"), article.get("cover_image_url")),
+        "article_rest_id": first_value(item.get("article_rest_id"), article.get("rest_id")),
+    }
+
+
+def parse_xquik_page(data):
+    tweets = []
+    for item in extract_xquik_items(data):
+        tweet = normalize_xquik_tweet(item)
+        if tweet:
+            tweets.append(tweet)
+    return tweets, extract_xquik_cursor(data)
 
 
 def headers():
@@ -581,7 +801,9 @@ def write_tweet(tweet):
 
     if is_article:
         cover_line = f"\n\n![]({tweet['article_cover']})" if tweet.get("article_cover") else ""
-        full_body = fetch_article_body(tweet["url"], tweet["article_title"], tweet.get("article_rest_id"))
+        full_body = None
+        if CT0 and AUTH_TOKEN:
+            full_body = fetch_article_body(tweet["url"], tweet["article_title"], tweet.get("article_rest_id"))
         if full_body:
             body = f"# {tweet['article_title']}\n\n{full_body}"
         else:
@@ -615,10 +837,12 @@ def parse_tweet_url(url):
 
 
 def main():
-    if not CT0 or not AUTH_TOKEN:
+    use_xquik = bool(xquik_api_key())
+    if not use_xquik and (not CT0 or not AUTH_TOKEN):
         print("Missing env vars. Export before running:")
         print("  export X_CT0=<ct0 cookie value>")
         print("  export X_AUTH_TOKEN=<auth_token cookie value>")
+        print("Or set XQUIK_API_KEY for the Hermes Tweet / Xquik backend.")
         sys.exit(1)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -631,8 +855,9 @@ def main():
             print(f"Invalid tweet URL: {url}")
             sys.exit(1)
 
-        print(f"Fetching single tweet {tweet_id}...")
-        tweet = fetch_single_tweet_data(tweet_id)
+        backend = "Xquik" if use_xquik else "X cookie"
+        print(f"Fetching single tweet {tweet_id} via {backend} backend...")
+        tweet = fetch_xquik_tweet(tweet_id) if use_xquik else fetch_single_tweet_data(tweet_id)
         written = write_tweet(tweet)
         if written:
             filename = f"{tweet['id']}_{safe_username(tweet['username'])}.md"
@@ -643,7 +868,9 @@ def main():
         return
 
     # Bulk bookmarks mode
+    backend = "Xquik" if use_xquik else "X cookie"
     print(f"Output: {OUTPUT_DIR}")
+    print(f"Backend: {backend}")
 
     cursor = None
     total_new = 0
@@ -653,8 +880,12 @@ def main():
         page += 1
         print(f"Fetching page {page}...", end=" ", flush=True)
 
-        data = fetch_page(cursor)
-        tweets, next_cursor = parse_page(data)
+        if use_xquik:
+            data = fetch_xquik_bookmarks_page(cursor)
+            tweets, next_cursor = parse_xquik_page(data)
+        else:
+            data = fetch_page(cursor)
+            tweets, next_cursor = parse_page(data)
 
         if not tweets:
             print(f"\nDone. {total_new} new bookmarks saved.")

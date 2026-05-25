@@ -1,6 +1,6 @@
 ---
 name: x-bookmarks
-description: Fetches X/Twitter bookmarks via cookie auth and saves each as a Markdown file optimized for Obsidian. Use when user says "fetch bookmarks", "sync x bookmarks", "import twitter bookmarks", "x bookmarks to markdown", or invokes /x-bookmarks.
+description: Fetches X/Twitter bookmarks via Hermes Tweet / Xquik or cookie auth and saves each as a Markdown file optimized for Obsidian. Use when user says "fetch bookmarks", "sync x bookmarks", "import twitter bookmarks", "x bookmarks to markdown", or invokes /x-bookmarks.
 ---
 
 # X Bookmarks → Markdown
@@ -9,6 +9,13 @@ Fetches all X/Twitter bookmarks and writes one `.md` file per tweet.
 
 ## Required env vars
 
+Recommended:
+```
+XQUIK_API_KEY=<xquik api key>
+# or HERMES_TWEET_API_KEY=<same api key>
+```
+
+Fallback:
 ```
 X_CT0=<ct0 cookie value>
 X_AUTH_TOKEN=<auth_token cookie value>
@@ -16,9 +23,22 @@ X_AUTH_TOKEN=<auth_token cookie value>
 
 Optional:
 - `X_BOOKMARKS_OUTPUT_DIR` (default: `~/.x-bookmarks/`)
+- `X_BOOKMARKS_FOLDER_ID` — Hermes Tweet / Xquik bookmark folder ID
+- `XQUIK_BASE_URL` — compatible API base URL (default: `https://xquik.com`)
 - `XAI_API_KEY` — xAI Grok API key. When set, fetches **full X article body** instead of preview. Get at https://console.x.ai
 
 ## How to get credentials
+
+Hermes Tweet / Xquik:
+1. Sign in at https://dashboard.xquik.com
+2. Open Account > API Keys
+3. Create an API key for this skill
+4. Export it before running:
+```bash
+export XQUIK_API_KEY=your_xquik_key
+```
+
+X cookie fallback:
 
 1. Open x.com in browser, log in
 2. DevTools (F12) → Application → Cookies → `https://x.com`
@@ -74,6 +94,8 @@ Tweet text here.
 
 - **Incremental**: stops pagination when first existing file found — safe to re-run anytime
 - **Dedup**: skips write if `{tweet_id}_{username}.md` already exists
+- **Backend selection**: uses Hermes Tweet / Xquik when an API key is set,
+  otherwise uses X cookie credentials
 - **Rate limit**: 1s sleep between pages; exits with clear message on 429
 - **Media**: photos embed inline (`![](url)`); videos link to highest-bitrate mp4
 - **Tags**: static `tweet`/`bookmark` + hashtags extracted from tweet text

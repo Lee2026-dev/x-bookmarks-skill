@@ -4,7 +4,24 @@ Fetches X/Twitter bookmarks and saves each as a Markdown file optimized for Obsi
 
 ## Setup
 
-### 1. Get X Cookie Credentials
+### 1. Choose a Backend
+
+**Hermes Tweet / Xquik** (recommended, no browser cookies):
+
+1. Sign in at [dashboard.xquik.com](https://dashboard.xquik.com/).
+2. Open [Account > API Keys](https://dashboard.xquik.com/en/account?tab=api-keys).
+3. Create an API key for this skill and copy it once.
+4. Set it as `XQUIK_API_KEY` or `HERMES_TWEET_API_KEY`.
+
+```bash
+export XQUIK_API_KEY=your_xquik_key
+```
+
+Leave `XQUIK_BASE_URL` unset for the default hosted API. Set it only if you use
+a compatible self-hosted endpoint. To sync one bookmark folder, set
+`X_BOOKMARKS_FOLDER_ID`.
+
+**X Cookie Credentials** (fallback):
 
 1. Open [x.com](https://x.com) in your browser and log in
 2. Open DevTools (F12) → Application → Cookies → `https://x.com`
@@ -20,6 +37,8 @@ export X_AUTH_TOKEN=your_auth_token_value
 
 **Optional:**
 - `X_BOOKMARKS_OUTPUT_DIR` — output directory (default: `~/.x-bookmarks/`)
+- `X_BOOKMARKS_FOLDER_ID` — Hermes Tweet / Xquik bookmark folder ID
+- `XQUIK_BASE_URL` — compatible API base URL (default: `https://xquik.com`)
 - `XAI_API_KEY` — xAI Grok API key for fetching full article bodies. Get at [console.x.ai](https://console.x.ai)
 
 ### 3. Install Dependencies
@@ -70,6 +89,8 @@ Tweet text here.
 
 - **Incremental sync** — stops pagination when first existing file found; safe to re-run anytime
 - **Deduplication** — skips write if file already exists
+- **Backend selection** — uses Hermes Tweet / Xquik when an API key is set,
+  otherwise uses X cookie credentials
 - **Rate limiting** — 1s sleep between pages; exits with clear message on 429
 - **Media support** — photos embed inline (`![](url)`); videos link to highest-bitrate mp4
 - **Hashtag extraction** — static tags + hashtags from tweet text
